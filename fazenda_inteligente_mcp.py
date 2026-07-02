@@ -2,8 +2,11 @@
 
 import json
 import random
+import sqlite3
 from datetime import datetime
 import sys
+
+HISTORICO_DB_PATH = "historico_fazenda.db"
 
 
 # ── Servidores MCP
@@ -184,7 +187,114 @@ class ServidorIrrigacao(MCPServer):
             }
 
 
-# ── MCP Client 
+class ServidorAlertas(MCPServer):
+    """Avalia leituras agregadas e detecta condições críticas para a fazenda."""
+
+    def __init__(self):
+        super().__init__("mcp-servidor-alertas")
+        self.registrar_tool(
+            "avaliar_condicoes",
+            "Avalia umidade, chuva prevista e status de irrigação e retorna alertas críticos.",
+            {"umidade_pct": "float", "chuva_mm": "float", "irrigacao_ativa": "bool"}
+        )
+
+    def _executar(self, nome_tool: str, argumentos: dict) -> dict:
+        if nome_tool == "avaliar_condicoes":
+            umidade = argumentos.get("umidade_pct", 50.0)
+            chuva_mm = argumentos.get("chuva_mm", 0.0)
+            irrigacao_ativa = argumentos.get("irrigacao_ativa", False)
+
+            alertas = []
+            if umidade < 20:
+                alertas.append({
+                    "nivel": "crítico",
+                    "mensagem": f"Umidade do solo criticamente baixa ({umidade}%). Irrigação urgente recomendada.",
+                })
+            if chuva_mm > 30:
+                alertas.append({
+                    "nivel": "crítico",
+                    "mensagem": f"Chuva excessiva prevista ({chuva_mm}mm). Risco de encharcamento/erosão.",
+                })
+            if umidade > 85 and irrigacao_ativa:
+                alertas.append({
+                    "nivel": "aviso",
+                    "mensagem": f"Irrigação ativa com solo já saturado ({umidade}%). Considere desligar.",
+                })
+
+            return {
+                "total_alertas": len(alertas),
+                "alertas": alertas,
+                "timestamp": datetime.now().isoformat(),
+            }
+
+
+class ServidorHistorico(MCPServer):
+    """Persiste leituras, decisões e alertas em um banco SQLite entre execuções."""
+
+    def __init__(self, db_path: str = HISTORICO_DB_PATH):
+        super().__init__("mcp-servidor-historico")
+        self._conn = sqlite3.connect(db_path)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS eventos (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                tipo TEXT NOT NULL,
+                zona TEXT,
+                dados TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.commit()
+        self.registrar_tool(
+            "registrar_evento",
+            "Registra um evento (leitura, decisão ou alerta) no histórico persistente.",
+            {"tipo": "string", "zona": "string", "dados": "dict"}
+        )
+        self.registrar_tool(
+            "consultar_historico",
+            "Consulta os últimos eventos registrados, opcionalmente filtrados por tipo e zona.",
+            {"tipo": "string (opcional)", "zona": "string (opcional)", "limite": "int"}
+        )
+
+    def _executar(self, nome_tool: str, argumentos: dict) -> dict:
+        if nome_tool == "registrar_evento":
+            tipo = argumentos.get("tipo", "evento")
+            zona = argumentos.get("zona")
+            dados = argumentos.get("dados", {})
+            timestamp = datetime.now().isoformat()
+            self._conn.execute(
+                "INSERT INTO eventos (timestamp, tipo, zona, dados) VALUES (?, ?, ?, ?)",
+                (timestamp, tipo, zona, json.dumps(dados, ensure_ascii=False)),
+            )
+            self._conn.commit()
+            return {"status": "registrado", "tipo": tipo, "zona": zona, "timestamp": timestamp}
+
+        if nome_tool == "consultar_historico":
+            tipo = argumentos.get("tipo")
+            zona = argumentos.get("zona")
+            limite = argumentos.get("limite", 10)
+
+            query = "SELECT timestamp, tipo, zona, dados FROM eventos WHERE 1=1"
+            params: list = []
+            if tipo:
+                query += " AND tipo = ?"
+                params.append(tipo)
+            if zona:
+                query += " AND zona = ?"
+                params.append(zona)
+            query += " ORDER BY id DESC LIMIT ?"
+            params.append(limite)
+
+            cursor = self._conn.execute(query, params)
+            eventos = [
+                {"timestamp": r[0], "tipo": r[1], "zona": r[2], "dados": json.loads(r[3])}
+                for r in cursor.fetchall()
+            ]
+            return {"total": len(eventos), "eventos": eventos}
+
+
+# ── MCP Client
 
 class MCPClient:
     """Roteia chamadas da IA aos servidores MCP via tools/list e tools/call."""
@@ -236,13 +346,25 @@ class AssistenteAgricolaIA:
             return self._calcular_volume()
         if any(w in p for w in ["ligar", "ativar"]):
             return self._ativar_irrigacao()
+        if any(w in p for w in ["alerta", "alertas", "crítico", "critico"]):
+            return self._verificar_alertas()
+        if any(w in p for w in ["histórico", "historico", "registro", "log"]):
+            return self._consultar_historico()
         return (
             "Posso ajudar com:\n"
             "  • Previsão do tempo\n"
             "  • Umidade do solo\n"
             "  • Volume de irrigação\n"
             "  • Ativar irrigação\n"
-            "  • Recomendação completa de irrigação"
+            "  • Recomendação completa de irrigação\n"
+            "  • Verificar alertas críticos\n"
+            "  • Consultar histórico de decisões"
+        )
+
+    def _registrar_historico(self, tipo: str, dados: dict) -> None:
+        self.cliente.chamar(
+            "mcp-servidor-historico", "registrar_evento",
+            {"tipo": tipo, "zona": self.zona, "dados": dados},
         )
 
     def _recomendar_irrigacao(self) -> str:
@@ -270,13 +392,37 @@ class AssistenteAgricolaIA:
         else:
             recomendacao = "Recomendado irrigar. Umidade baixa e sem chuva prevista."
 
+        alerta_resultado = self.cliente.chamar(
+            "mcp-servidor-alertas", "avaliar_condicoes",
+            {
+                "umidade_pct": um_pct,
+                "chuva_mm": chuva_mm,
+                "irrigacao_ativa": irrigacao["irrigacao_ativa"],
+            }
+        )
+        alertas = alerta_resultado["alertas"]
+
+        self._registrar_historico("decisao_irrigacao", {
+            "umidade_pct": um_pct,
+            "chuva_mm": chuva_mm,
+            "irrigacao_ativa": irrigacao["irrigacao_ativa"],
+            "recomendacao": recomendacao,
+            "alertas_disparados": len(alertas),
+        })
+
+        alertas_str = (
+            "\n".join(f"  ⚠ [{a['nivel'].upper()}] {a['mensagem']}" for a in alertas)
+            if alertas else "  Nenhum alerta crítico no momento."
+        )
+
         return (
             f"═══ RECOMENDAÇÃO DE IRRIGAÇÃO ═══\n"
             f"Zona             : {self.zona}\n"
             f"Umidade do solo  : {um_pct}% ({umidade['status']})\n"
             f"Chuva prevista   : {chuva_mm}mm\n"
             f"Irrigação ativa  : {'Sim' if irrigacao['irrigacao_ativa'] else 'Não'}\n"
-            f"\n{recomendacao}"
+            f"\n{recomendacao}\n"
+            f"\nAlertas:\n{alertas_str}"
         )
 
     def _consultar_clima(self) -> str:
@@ -358,6 +504,13 @@ class AssistenteAgricolaIA:
             "mcp-servidor-irrigacao", "ativar_irrigacao",
             {"zona": self.zona, "duracao_minutos": volume["duracao_estimada_minutos"]}
         )
+
+        self._registrar_historico("ativacao_irrigacao", {
+            "duracao_minutos": resultado["duracao_minutos"],
+            "volume_litros": volume["volume_recomendado_litros"],
+            "inicio": resultado["inicio"],
+        })
+
         return (
             f"═══ IRRIGAÇÃO ATIVADA ═══\n"
             f"{resultado['status']}\n"
@@ -366,6 +519,58 @@ class AssistenteAgricolaIA:
             f"Início        : {resultado['inicio']}\n"
             f"Previsão fim  : {resultado['previsao_termino']}"
         )
+
+    def _verificar_alertas(self) -> str:
+        print("  [IA] Verificando condições críticas...\n")
+        umidade = self.cliente.chamar(
+            "mcp-servidor-umidade-solo", "ler_umidade",
+            {"zona": self.zona, "profundidade_cm": 20}
+        )
+        clima = self.cliente.chamar(
+            "mcp-servidor-clima", "obter_previsao",
+            {"localizacao": self.localizacao, "dias": 1}
+        )
+        irrigacao = self.cliente.chamar(
+            "mcp-servidor-irrigacao", "status_irrigacao",
+            {"zona": self.zona}
+        )
+        chuva_mm = clima["previsao"][0].get("chuva_mm", 0) if clima["previsao"] else 0
+
+        resultado = self.cliente.chamar(
+            "mcp-servidor-alertas", "avaliar_condicoes",
+            {
+                "umidade_pct": umidade["umidade_pct"],
+                "chuva_mm": chuva_mm,
+                "irrigacao_ativa": irrigacao["irrigacao_ativa"],
+            }
+        )
+        alertas = resultado["alertas"]
+
+        for alerta in alertas:
+            self._registrar_historico("alerta", alerta)
+
+        if not alertas:
+            return "═══ ALERTAS ═══\nNenhum alerta crítico no momento. Tudo dentro do esperado."
+
+        alertas_str = "\n".join(f"  ⚠ [{a['nivel'].upper()}] {a['mensagem']}" for a in alertas)
+        return f"═══ ALERTAS ({len(alertas)}) ═══\n{alertas_str}"
+
+    def _consultar_historico(self) -> str:
+        print("  [IA] Consultando histórico persistente...\n")
+        resultado = self.cliente.chamar(
+            "mcp-servidor-historico", "consultar_historico",
+            {"zona": self.zona, "limite": 10}
+        )
+        eventos = resultado["eventos"]
+
+        if not eventos:
+            return "═══ HISTÓRICO ═══\nNenhum evento registrado ainda."
+
+        eventos_str = "\n".join(
+            f"  [{e['timestamp']}] {e['tipo']} — {json.dumps(e['dados'], ensure_ascii=False)}"
+            for e in eventos
+        )
+        return f"═══ HISTÓRICO — últimos {len(eventos)} eventos ({self.zona}) ═══\n{eventos_str}"
 
 
 # ── Interface de simulação 
@@ -380,6 +585,8 @@ def inicializar_sistema() -> AssistenteAgricolaIA:
     client.conectar(ServidorClima())
     client.conectar(ServidorUmidadeSolo())
     client.conectar(ServidorIrrigacao())
+    client.conectar(ServidorAlertas())
+    client.conectar(ServidorHistorico())
     return AssistenteAgricolaIA(client), client
 
 
@@ -398,6 +605,8 @@ def rodar_demo():
         "Qual a umidade do solo agora?",
         "Quantos litros de água devo usar?",
         "Pode ligar a irrigação?",
+        "Há algum alerta crítico agora?",
+        "Mostre o histórico de decisões",
     ]
 
     for pergunta in perguntas:
