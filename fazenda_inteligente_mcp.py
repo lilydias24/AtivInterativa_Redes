@@ -313,6 +313,9 @@ class MCPClient:
             for t in srv.listar_tools()
         ]
 
+    def obter_servidor(self, nome: str):
+        return self._servidores.get(nome)
+
     def chamar(self, servidor: str, tool: str, args: dict) -> dict:
         if servidor not in self._servidores:
             return {"erro": f"Servidor '{servidor}' não conectado."}

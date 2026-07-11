@@ -14,6 +14,7 @@ Simulação em Python de um assistente de IA que orquestra múltiplos servidores
 - [Por que MCP foi o protocolo escolhido](#por-que-mcp-foi-o-protocolo-escolhido)
 - [Arquitetura implementada](#arquitetura-implementada)
 - [Funcionalidades implementadas](#funcionalidades-implementadas)
+- [Evolução: protocolos de rede reais (MQTT + HTTP/SSE)](#evolução-protocolos-de-rede-reais-mqtt--httpsse)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Trabalhos futuros](#trabalhos-futuros)
 
@@ -37,6 +38,10 @@ python fazenda_inteligente_mcp.py
 
 # Modo interativo (você digita as perguntas)
 python fazenda_inteligente_mcp.py -i
+
+# Evolução: mesma simulação, mas com MQTT e HTTP+SSE reais por baixo
+# (ver seção "Evolução: protocolos de rede reais" mais abaixo)
+python fazenda_inteligente_redes.py
 ```
 
 No modo interativo, digite `sair`, `exit` ou `quit` para encerrar.
@@ -159,23 +164,69 @@ Produtor rural (linguagem natural)
 - **Dois modos de uso:** demo automático com perguntas pré-definidas e modo interativo via terminal (`-i`);
 - **Sem dependências externas:** roda com Python padrão, sem instalação adicional.
 
+## Evolução: protocolos de rede reais (MQTT + HTTP/SSE)
+
+A simulação original (`fazenda_inteligente_mcp.py`) representa os servidores MCP como objetos Python chamados diretamente em processo — bom para focar na arquitetura MCP, mas nenhum byte de fato trafega pela rede. O arquivo `fazenda_inteligente_redes.py` evolui exatamente os dois pontos que ficaram como "trabalhos futuros": implementa de verdade um segundo protocolo (MQTT) e o segundo transporte oficial do MCP (HTTP + SSE), ambos usando apenas sockets da biblioteca padrão do Python — sem `paho-mqtt`, sem frameworks HTTP externos.
+
+```bash
+python fazenda_inteligente_redes.py
+```
+
+### MQTT real para o sensor de umidade do solo
+
+`redes/mqtt_protocolo.py` implementa o **formato de pacotes do MQTT 3.1.1** (subset QoS 0) byte a byte sobre `socket.socket` TCP: cabeçalho fixo, *remaining length* codificado em variável, CONNECT/CONNACK, SUBSCRIBE/SUBACK, PUBLISH e PINGREQ/PINGRESP — os mesmos pacotes que um broker real como o Mosquitto trocaria.
+
+- `MQTTBroker`: aceita conexões TCP, mantém as assinaturas por tópico (com suporte aos wildcards `+` e `#`) e encaminha cada `PUBLISH` para os assinantes correspondentes.
+- `SensorUmidadeIoT` (`redes/sensor_umidade.py`): conecta-se ao broker como cliente MQTT e **publica** leituras (com deriva realista, não puro ruído) no tópico `fazenda/zona-1/umidade` a cada 2 segundos.
+- `ServidorUmidadeMQTT` (`redes/sensor_umidade.py`): conecta-se ao mesmo broker, **assina** o tópico e serve a leitura mais recente pelas mesmas tools MCP (`ler_umidade`, `historico_umidade`) que a simulação original já usava.
+
+Isso concretiza o que o README já argumentava: o MQTT alimentando um servidor MCP com dados reais de sensor, em vez de números aleatórios gerados na hora da chamada.
+
+### HTTP + SSE real para o servidor de clima
+
+`redes/servidor_http.py` expõe um `MCPServer` (aqui, o `ServidorClima` original, reaproveitado por composição) como um **servidor HTTP de verdade** (`http.server.ThreadingHTTPServer`):
+
+- `GET /tools/list` — descoberta dinâmica de ferramentas, agora buscada pela rede em vez de hardcoded;
+- `POST /tools/call` — invocação de uma tool com argumentos JSON no corpo;
+- `GET /eventos` — stream de **Server-Sent Events** com atualizações de previsão do tempo, demonstrando o *server push* que HTTP puro não oferece.
+
+`redes/cliente_http.py` implementa o lado cliente (`ServidorHTTPProxy`) usando apenas `urllib.request` e `http.client`. O ponto central: essa classe tem a **mesma interface** (`listar_tools`, `chamar_tool`) que um `MCPServer` local, então o `MCPClient` e o `AssistenteAgricolaIA` originais funcionam sem nenhuma alteração — só o transporte por baixo do tópico `mcp-servidor-clima` mudou, de chamada de método em processo para requisição HTTP real.
+
+### O que isso demonstra na prática
+
+| Camada                         | Antes (`fazenda_inteligente_mcp.py`) | Depois (`fazenda_inteligente_redes.py`)              |
+|---------------------------------|----------------------------------------|--------------------------------------------------------|
+| Umidade do solo                 | `random.uniform` chamado em processo   | Sensor IoT publica via **MQTT real** (sockets TCP)      |
+| Clima                            | Método Python chamado em processo      | Servidor **HTTP real** com `tools/list`/`tools/call`     |
+| Notificações de clima            | Não existiam                            | **Server-Sent Events** via `GET /eventos`                |
+| Irrigação, alertas, histórico    | Objetos Python em processo              | Sem alteração (permanecem locais)                        |
+| IA / lógica de decisão           | `AssistenteAgricolaIA`                  | A mesma classe, sem nenhuma mudança de código             |
+
+A camada de IA não sabe, nem precisa saber, que a umidade chegou por MQTT ou que o clima foi buscado por HTTP — a fronteira MCP (`tools/list`, `tools/call`) é a mesma independentemente do transporte por baixo, o que é exatamente o argumento de "extensibilidade sem reescrita" já defendido neste README.
+
 ## Estrutura do projeto
 
 ```
 .
-├── fazenda_inteligente_mcp.py   # Simulação completa: servidores, client e assistente IA
-├── historico_fazenda.db         # Banco SQLite gerado em tempo de execução (ignorado no git)
-└── README.md                    # Este arquivo
+├── fazenda_inteligente_mcp.py    # Simulação original: servidores, client e assistente IA em processo
+├── fazenda_inteligente_redes.py  # Evolução: mesma IA, com MQTT e HTTP+SSE reais por baixo
+├── redes/
+│   ├── mqtt_protocolo.py         # MQTT 3.1.1 (subset QoS 0) implementado sobre sockets TCP
+│   ├── sensor_umidade.py         # Sensor IoT (publisher) + servidor MCP de umidade (subscriber) via MQTT
+│   ├── servidor_http.py          # Servidor HTTP+SSE que expõe um MCPServer pela rede
+│   └── cliente_http.py           # Proxy MCP client-side que fala HTTP/SSE de verdade
+├── historico_fazenda.db          # Banco SQLite gerado em tempo de execução (ignorado no git)
+└── README.md                     # Este arquivo
 ```
 
 ## Trabalhos futuros
 
-- **Transporte real MCP:** substituir as chamadas Python diretas por transporte via stdio ou HTTP com SSE, conforme especifica o protocolo;
+- ~~**Transporte real MCP:** substituir as chamadas Python diretas por transporte via stdio ou HTTP com SSE~~ — feito para o clima via HTTP+SSE (`redes/servidor_http.py`); falta o transporte stdio (JSON-RPC 2.0 sobre `stdin`/`stdout` entre processos) para os demais servidores;
 - **Integração com LLM:** conectar à API do Claude para interpretação real de linguagem natural, eliminando o roteamento baseado em palavras-chave;
-- **Sensores:** substituir os dados simulados por leituras reais de dispositivos IoT, usando MQTT ou CoAP como protocolo de coleta complementando o MCP na camada de sensoriamento;
+- ~~**Sensores:** substituir os dados simulados por leituras reais de dispositivos IoT, usando MQTT~~ — feito para a umidade do solo (`redes/sensor_umidade.py`); CoAP continua como alternativa não implementada para sensores ainda mais restritos;
 - **Interface web:** dashboard com visualização em tempo real dos dados da fazenda, consumindo os mesmos servidores MCP via HTTP+SSE.
 
 ---
 
-> *Simulação implementada em Python no arquivo `fazenda_inteligente_mcp.py`*
-> *Execução: `python fazenda_inteligente_mcp.py` (demo) ou `-i` (interativo)*
+> *Simulação implementada em Python no arquivo `fazenda_inteligente_mcp.py`, com evolução para protocolos de rede reais (MQTT + HTTP/SSE) em `fazenda_inteligente_redes.py` e no pacote `redes/`.*
+> *Execução: `python fazenda_inteligente_mcp.py` (demo) ou `-i` (interativo); `python fazenda_inteligente_redes.py` para a versão com rede real.*
